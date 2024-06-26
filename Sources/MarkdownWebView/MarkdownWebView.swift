@@ -1,3 +1,11 @@
+//
+//  CustomWebView.swift
+//  Invisibility
+//
+//  Created by minjune Song on 6/25/24.
+//  Copyright © 2024 Invisibility Inc. All rights reserved.
+//
+
 import SwiftUI
 import WebKit
 
@@ -9,21 +17,21 @@ import WebKit
 
 #if !os(visionOS)
     @available(macOS 11.0, iOS 14.0, *)
-    public struct MarkdownWebView: PlatformViewRepresentable {
-        var markdownContent: String
+    public struct EditableMarkdownWebView: PlatformViewRepresentable {
+        @Binding var markdownContent: String
         let customStylesheet: String?
         let linkActivationHandler: ((URL) -> Void)?
         let renderedContentHandler: ((String) -> Void)?
 
-        public init(_ markdownContent: String, customStylesheet: String? = nil) {
-            self.markdownContent = markdownContent
+        public init(_ markdownContent: Binding<String>, customStylesheet: String? = nil) {
+            self._markdownContent = markdownContent
             self.customStylesheet = customStylesheet
             linkActivationHandler = nil
             renderedContentHandler = nil
         }
 
-        init(_ markdownContent: String, customStylesheet: String?, linkActivationHandler: ((URL) -> Void)?, renderedContentHandler: ((String) -> Void)?) {
-            self.markdownContent = markdownContent
+        init(_ markdownContent: Binding<String>, customStylesheet: String?, linkActivationHandler: ((URL) -> Void)?, renderedContentHandler: ((String) -> Void)?) {
+            self._markdownContent = markdownContent
             self.customStylesheet = customStylesheet
             self.linkActivationHandler = linkActivationHandler
             self.renderedContentHandler = renderedContentHandler
@@ -37,9 +45,12 @@ import WebKit
             public func makeUIView(context: Context) -> CustomWebView { context.coordinator.platformView }
         #endif
 
-        func updatePlatformView(_ platformView: CustomWebView, context _: Context) {
-            guard !platformView.isLoading else { return } /// This function might be called when the page is still loading, at which time `window.proxy` is not available yet.
-            platformView.updateMarkdownContent(markdownContent)
+        func updatePlatformView(_ platformView: CustomWebView, context: Context) {
+            guard !platformView.isLoading else { return }
+            if context.coordinator.lastContent != markdownContent {
+                context.coordinator.lastContent = markdownContent
+                platformView.updateMarkdownContent(markdownContent)
+            }
         }
 
         #if os(macOS)
@@ -49,19 +60,20 @@ import WebKit
         #endif
 
         public func onLinkActivation(_ linkActivationHandler: @escaping (URL) -> Void) -> Self {
-            .init(markdownContent, customStylesheet: customStylesheet, linkActivationHandler: linkActivationHandler, renderedContentHandler: renderedContentHandler)
+            .init($markdownContent, customStylesheet: customStylesheet, linkActivationHandler: linkActivationHandler, renderedContentHandler: renderedContentHandler)
         }
 
         public func onRendered(_ renderedContentHandler: @escaping (String) -> Void) -> Self {
-            .init(markdownContent, customStylesheet: customStylesheet, linkActivationHandler: linkActivationHandler, renderedContentHandler: renderedContentHandler)
+            .init($markdownContent, customStylesheet: customStylesheet, linkActivationHandler: linkActivationHandler, renderedContentHandler: renderedContentHandler)
         }
 
         public class Coordinator: NSObject, WKNavigationDelegate, WKScriptMessageHandler {
-            let parent: MarkdownWebView
+            var parent: EditableMarkdownWebView
             let platformView: CustomWebView
             var startTime: CFAbsoluteTime?
+            var lastContent: String = ""
 
-            init(parent: MarkdownWebView) {
+            init(parent: EditableMarkdownWebView) {
                 startTime = CFAbsoluteTimeGetCurrent()
                 self.parent = parent
                 platformView = .init()
@@ -75,27 +87,23 @@ import WebKit
                     }
                 #endif
 
-                /// So that the `View` adjusts its height automatically.
                 platformView.setContentHuggingPriority(.required, for: .vertical)
 
-                /// Disables scrolling.
                 #if os(iOS)
-                    platformView.scrollView.isScrollEnabled = false
+                    platformView.scrollView.isScrollEnabled = true
                 #endif
 
-                /// Set transparent background.
                 #if os(macOS)
                     platformView.setValue(false, forKey: "drawsBackground")
-                /// Equavalent to `.setValue(true, forKey: "drawsTransparentBackground")` on macOS 10.12 and before, which this library doesn't target.
                 #elseif os(iOS)
                     platformView.isOpaque = false
                 #endif
 
-                /// Receive messages from the web view.
                 platformView.configuration.userContentController = .init()
                 platformView.configuration.userContentController.add(self, name: "sizeChangeHandler")
                 platformView.configuration.userContentController.add(self, name: "renderedContentHandler")
                 platformView.configuration.userContentController.add(self, name: "copyToPasteboard")
+                platformView.configuration.userContentController.add(self, name: "contentChangeHandler")
 
                 #if os(macOS)
                     let defaultStylesheetFileName = "default-macOS"
@@ -115,10 +123,10 @@ import WebKit
                 let htmlString = templateString
                     .replacingOccurrences(of: "PLACEHOLDER_SCRIPT", with: script)
                     .replacingOccurrences(of: "PLACEHOLDER_STYLESHEET", with: self.parent.customStylesheet ?? defaultStylesheet)
+                    .replacingOccurrences(of: "<div id=\"content\"></div>", with: "<div id=\"content\" contenteditable=\"true\"></div>")
                 platformView.loadHTMLString(htmlString, baseURL: nil)
             }
 
-            /// Update the content on first finishing loading.
             public func webView(_ webView: WKWebView, didFinish _: WKNavigation!) {
                 (webView as! CustomWebView).updateMarkdownContent(parent.markdownContent)
             }
@@ -169,9 +177,24 @@ import WebKit
                 case "copyToPasteboard":
                     guard let base64EncodedString = message.body as? String else { return }
                     base64EncodedString.trimmingCharacters(in: .whitespacesAndNewlines).copyToPasteboard()
+                case "contentChangeHandler":
+                    guard let newContent = message.body as? String else { return }
+                    if newContent != parent.markdownContent {
+                        DispatchQueue.main.async {
+                            self.parent.markdownContent = newContent
+                        }
+                    }
                 default:
                     return
                 }
+            }
+
+            deinit {
+                platformView.configuration.userContentController.removeAllUserScripts()
+                platformView.configuration.userContentController.removeScriptMessageHandler(forName: "sizeChangeHandler")
+                platformView.configuration.userContentController.removeScriptMessageHandler(forName: "renderedContentHandler")
+                platformView.configuration.userContentController.removeScriptMessageHandler(forName: "copyToPasteboard")
+                platformView.configuration.userContentController.removeScriptMessageHandler(forName: "contentChangeHandler")
             }
         }
 
@@ -182,7 +205,6 @@ import WebKit
                 .init(width: super.intrinsicContentSize.width, height: contentHeight)
             }
 
-            /// Disables scrolling.
             #if os(macOS)
                 override public func scrollWheel(with event: NSEvent) {
                     super.scrollWheel(with: event)
@@ -190,7 +212,6 @@ import WebKit
                 }
             #endif
 
-            /// Removes "Reload" from the context menu.
             #if os(macOS)
                 override public func willOpenMenu(_ menu: NSMenu, with _: NSEvent) {
                     menu.items.removeAll { $0.identifier == .init("WKMenuItemIdentifierReload") }
